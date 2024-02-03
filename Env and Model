@@ -1,0 +1,658 @@
+import matplotlib.pyplot as plt
+import pandas as pd
+import gym
+from gym import spaces
+import numpy as np
+import random
+from datetime import datetime
+from datetime import timedelta
+import pickle
+import seaborn as sns
+import chainer
+import chainer.functions as F
+import chainer.links as L
+from chainer import serializers
+import arch
+
+def CreateSyntheticData(desired_intervals = 1000, nonstationary=0, nonstationary_multiplier=1, mean=1.4879607683974573e-05, std=0.0025571644141227845):
+  syn = pd.DataFrame(columns=['Timestamp','Close'])
+  initial_value = random.randint(30000,70000)
+
+  # sample = price_changes
+  # sample = abs(sample)
+  # signs = np.array(random.choices([-1,1], k=desired_intervals))
+
+  # price_changes = random.choices(sample, k=desired_intervals)
+  # price_changes = price_changes * signs#np.array(1)
+
+  if nonstationary == 0:
+    price_changes = np.random.normal(mean, std, desired_intervals)
+  elif nonstationary == 1:
+    mean = 1.4879607683974573e-05
+    std = 0.0025571644141227845 * 1
+    number_ints = 50000
+    price_changes = []
+
+    for i in range(number_ints):
+      price_change = np.random.choice(np.random.normal(mean, std, 1000))
+
+      price_changes.append(price_change)
+      mean += np.random.choice([-2.9759215367949145e-08 * nonstationary_multiplier,2.9759215367949145e-08 * nonstationary_multiplier])
+      std += np.random.choice([-0.00010228657656491139 * nonstationary_multiplier, 0.00010228657656491139 * nonstationary_multiplier])
+      if std < 0:
+        std = abs(std)
+
+    price_changes = price_changes[-desired_intervals:]
+
+  # Initialize an empty list to store the results
+  result_list = []
+  timestamp = pd.to_datetime(datetime.today()) - timedelta(days=365)
+  time_list = []
+  # Iterate through the values in the final list and multiply each by the initial value
+  for value in price_changes:
+      initial_value = initial_value + initial_value * value
+      result_list.append(initial_value)
+
+      timestamp = timestamp + timedelta(seconds=300)
+      time_list.append(timestamp)
+
+  #syn['Price Change'] = price_changes
+  syn['Close'] = result_list
+  syn['Timestamp'] = time_list
+
+  syn.dropna(inplace=True)
+
+  return syn
+
+mean = 1.4879607683974573e-05
+std = 0.0025571644141227845
+samples = 232466
+
+"""Want to have variables:
+- % change portfolio value since buy
+- std deviation recent price change (1000 intervals?)
+- mean recent price change (1000 intervals?)
+
+Also do analysis on autocorrelation of volatility. This will let the model strategize and there has to be something there.
+"""
+
+def min_max_scaling(data, min_range=-1, max_range=1):
+    min_val = min(data)
+    max_val = max(data)
+
+    # Check for division by zero
+    if (max_val - min_val) == 0:
+
+        return data
+
+    scaled_data = [((x - min_val) / (max_val - min_val)) * (max_range - min_range) + min_range for x in data]
+    return scaled_data
+
+def count_zeros_and_twos(arr):
+    count = 0
+    for num in arr:
+        if num == 0 or num == 2:
+            count += 1
+    return count
+
+def calculate_reward(actions, returns, risk_free_rate=0):
+    if len(returns) < 2:
+        # Handle case where 'returns' has less than 2 elements
+        return 0
+
+    # Assuming 'actions' is a vector of actions taken by the agent
+    # and 'returns' is a vector of returns corresponding to each action
+    returns_arr = np.diff(returns)
+
+    if returns[0] == 0:
+        # Handle case where returns[0] is zero to avoid division by zero
+        returns_arr = np.diff(returns) / (returns[0] + 1e-10)
+    else:
+        returns_arr = np.diff(returns) / returns[0]
+
+    # Encourage trading by penalizing no-action
+    no_action_penalty = -1 * count_zeros_and_twos(actions)  # Adjust the penalty as needed
+
+    # Calculate average return
+    avg_return = returns_arr.mean()
+
+    # Sortino ratio components
+    downside_returns = returns_arr[returns_arr < 0]
+    downside_deviation = downside_returns.std()
+
+    # Handle cases where both avg_return and downside_deviation are zero
+    if avg_return == 0 and downside_deviation == 0:
+        sortino_ratio = 0
+    else:
+        # Sortino ratio
+        sortino_ratio = (avg_return - risk_free_rate) / (downside_deviation + 1e-10)
+    if pd.isnull(sortino_ratio):
+        sortino_ratio = 0
+    # Total reward including penalty
+    total_reward = sortino_ratio + no_action_penalty
+
+    return total_reward
+
+class RandomTradingEnv(gym.Env):
+    def __init__(self, history_t = 12):
+        super(RandomTradingEnv, self).__init__()
+
+        self.history_t = history_t
+
+        self.share_price = 10
+
+        self.initial_capital = 50
+        self.current_step = 0
+        self.max_steps = 10000  # Define the number of steps for the episode
+
+        self.action_space = spaces.Discrete(3)  # 0: Hold, 1: Buy, 2: Sell
+        self.observation_space = spaces.Box(low=-2, high=2, shape=(1,))
+
+        self.price = random.randint(30000,70000)  # Initial price
+        self.portfolio_value = 50#self.initial_capital
+        self.cash = self.initial_capital
+        self.last_nonstay_dec = 2
+
+    def reset(self):
+        self.current_step = 0
+        self.price = random.randint(30000,70000)
+        self.portfolio_value = 50 #self.initial_capital
+        self.cash = self.initial_capital
+
+        self.buyin = [0] #will use this to gauge the price of bitcoin since buying
+        self.last_nonstay_dec = 2
+
+        self.share_price = 10
+
+        self.price_change = 0
+        self.rewards = []
+
+        self.in_btc = 0 # dummy variable whether in bitcoin or not
+        self.portfolio_change = 0 # percent change since buying bitcoin
+
+        self.history_safeguard = [100 for _ in range(self.history_t)]
+
+        self.price_changes = [0] #will get the mean of this as our mean and std variables
+
+        self.cash_history = [50]
+        self.portfolio_value_history = [50]
+
+        self.portfolio_history = [100]
+
+        self.history1 = [0 for i in range(self.history_t)]
+        self.history2 = [0 for i in range(self.history_t)]
+
+        self.history = [0] + self.history1 + self.history2
+
+        self.mean = 0#.0015615087596329946
+        self.std = 0.0377589427071634 * 1
+
+        self.shares_held = 5
+
+        self.history = list(map(np.float32, self.history))
+
+
+        self.history_acts = [np.random.randint(3) for _ in range(self.history_t - 1)] + [2]
+
+        return self.history  # Normalized price
+
+    def step(self, action):
+        self.current_step += 1
+
+        self.history_acts.append(action)
+
+        self.price_change = np.random.choice(np.random.normal(self.mean, self.std, 5000))
+
+        self.history2.pop(0)
+        self.history2.append(self.price_change)
+        # if self.price_change >= 0:
+        #   self.history2.append(1)
+        # else:
+        #   self.history2.append(-1)
+
+        multiple = 1
+        #self.mean += np.random.choice([0.0015615087596329946/500 * multiple,0.0015615087596329946/500  * multiple]) #adds or subtracts a multiple of one 500th of the previous mean
+        #self.std += abs(np.random.choice([0.0377589427071634/500 * multiple, 0.0377589427071634/500 * multiple]))
+
+        self.price += self.price * self.price_change
+        self.share_price += self.share_price * self.price_change
+
+        reward = 0
+
+        self.portfolio_value += self.portfolio_value * (self.price_change)
+
+        self.history_safeguard.pop(0)
+        self.history_safeguard.append((self.cash + self.portfolio_value))
+
+        self.portfolio_history.append((self.cash + self.portfolio_value))
+
+        if self.in_btc == 1:
+          if self.buyin != 0: #for safety
+            self.portfolio_change = (self.price - self.buyin) / self.buyin #this should be price and not portfolio_value, right?
+          else:
+            self.portfolio_change = 0
+        elif self.in_btc == 0:
+          reward_for_selling = self.price_change * -1
+
+
+        if action == 1:  # Buy
+            if True:#self.in_btc == 0: #self.cash >= self.price:
+              if self.cash >= self.share_price:
+                self.portfolio_value += self.share_price
+                self.cash -= self.share_price
+                self.shares_held += 1
+              else:
+                self.portfolio_value += self.cash
+                self.cash = 0
+              self.buyin = self.price
+              self.last_nonstay_dec = 1
+              self.in_btc = 1
+            else:
+              pass
+
+        elif action == 2:  # Sell
+            if True:#self.in_btc == 0: #self.cash >= self.price:
+              if self.portfolio_value >= self.share_price:
+                self.cash += self.share_price
+                self.portfolio_value -= self.share_price
+                self.shares_held -= 1
+              else:
+                self.cash += self.portfolio_value
+                self.portfolio_value = 0
+                self.shares_held = 0
+              self.buyin = self.price
+              self.last_nonstay_dec = 2
+              self.in_btc = 0
+            else:
+              pass
+
+        if len(self.price_changes) >= 1000:
+          self.price_changes.pop(0)
+        self.price_changes.append(self.price_change)
+
+        self.history1.pop(0)
+        self.history1.append(action)
+
+        self.history = [self.shares_held] + self.history1 + self.history2
+
+
+
+        self.cash_history.append(self.cash)
+        self.portfolio_value_history.append(self.portfolio_value)
+
+        reward = [0,0,0]
+        if self.current_step >= self.history_t:
+##########This needs to be reworked. It was giving nans##################################
+          hypo1 = calculate_reward(self.history1, np.array(self.portfolio_history[-11:]) / self.portfolio_history[-11] + [self.portfolio_value_history[-2] * self.price_change + self.cash_history[-2]])
+          #buy
+          if self.cash_history[-2] >= self.share_price:
+            hypo2 = calculate_reward(self.history1, np.array(self.portfolio_history[-11:]) / self.portfolio_history[-11] + [(self.portfolio_value_history[-2] + self.share_price) * self.price_change + self.cash_history[-2] - self.share_price])
+          else:
+            hypo2 = calculate_reward(self.history1, np.array(self.portfolio_history[-11:]) / self.portfolio_history[-11] + [(self.portfolio_value_history[-2] + self.cash_history[-2]) * self.price_change])
+          #sell
+          if self.portfolio_value_history[-2] >= self.share_price:
+            hypo3 = calculate_reward(self.history1, np.array(self.portfolio_history[-11:]) / self.portfolio_history[-11] + [(self.portfolio_value_history[-2] - self.share_price) * self.price_change + self.cash_history[-2] + self.share_price])
+          else:
+            hypo3 = calculate_reward(self.history1, np.array(self.portfolio_history[-11:]) / self.portfolio_history[-11] + [(self.portfolio_value_history[-2] + self.cash_history[-2])])
+          reward = [hypo1, hypo2, hypo3]
+          # if pd.isnull(hypo1):
+            # print('self.portfolio_history[-11] + [self.portfolio_value_history[-2] * self.price_change + self.cash_history[-2]]', self.portfolio_history[-11] + [self.portfolio_value_history[-2] * self.price_change + self.cash_history[-2]])
+            # print("self.history1:", self.history1)
+            # print("self.portfolio_history:", self.portfolio_history)
+            # print("self.portfolio_value_history:", self.portfolio_value_history)
+            # print("self.cash_history:", self.cash_history)
+        self.rewards.append(reward)
+
+        reward = np.array(min_max_scaling(np.array(self.rewards).flatten().tolist())).reshape(np.array(self.rewards).shape).tolist()[-1]
+        # Calculate done and info
+        done = self.current_step >= self.max_steps
+
+        self.history = list(map(np.float32, self.history))
+
+
+        # reward = [-1,self.price_change,-self.price_change]
+        # if self.current_step >= self.history_t:
+        #   if self.portfolio_history[-1] == 0:
+        #     self.portfolio_history = [x + .0001 for x in self.portfolio_history]
+        #   reward = [x + ((self.portfolio_history[-1] - self.portfolio_history[-self.history_t]) / self.portfolio_history[-self.history_t]) for x in reward]
+        reward = list(map(np.float32, reward))
+        return self.history, reward, done
+
+# Create the environment
+env = RandomTradingEnv()
+
+print(env.reset())
+for _ in range(15):
+    pact = np.random.randint(3)
+    print(env.step(pact))
+    if _ > 12:
+      print(env.portfolio_history[-11])
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Q_Network(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(Q_Network, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.fc3 = nn.Linear(hidden_size, hidden_size)
+        self.fc4 = nn.Linear(hidden_size, hidden_size)
+        self.output = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        h = F.relu(self.fc1(x))
+        h1 = F.relu(self.fc2(h))
+        h2 = F.relu(self.fc3(h1))
+        h3 = F.relu(self.fc4(h2))
+
+        h4 = F.relu(self.fc4(h3))
+        h5 = F.relu(self.fc4(h4))
+        h6 = F.relu(self.fc4(h5))
+        h7 = F.relu(self.fc4(h6))
+
+        h8 = F.relu(self.fc4(h7))
+        h9 = F.relu(self.fc4(h8))
+        h10 = F.relu(self.fc4(h9))
+        h11 = F.relu(self.fc4(h10))
+
+        output = self.output(h11)
+        return output
+
+    def reset(self):
+        self.zero_grad()
+
+losses = []
+class QLearningAgent:
+    def __init__(self, model, target_model, num_states, num_actions, alpha=0.1, gamma=0.99, update_frequency=25):
+        self.num_states = num_states
+        self.num_actions = num_actions
+        self.alpha = alpha  # learning rate
+        self.gamma = gamma  # discount factor
+        self.primary_model = model
+        self.target_model = target_model
+        self.optimizer = chainer.optimizers.RMSprop(lr=0.001, alpha=0.25, eps=1e-5)
+        self.optimizer.setup(self.primary_model)
+
+        self.update_frequency = update_frequency
+        self.update_count = 0
+
+    def get_q_value(self, state, action=0):
+
+        q = self.primary_model(np.array([state]))
+
+        return q
+
+    def update_q_value(self, state, action, reward, next_state, t):
+        self.primary_model.cleargrads()
+        self.target_model.cleargrads()
+
+        current_q_values = self.primary_model(np.array([state]))
+        max_next_q_value = self.target_model(np.array([next_state])).data.max()
+
+        self.alpha = .9#1 / (t+1)
+
+        # Calculate Q-value with Double Q-learning
+        updated_q_value = (np.array(reward) + (self.gamma * max_next_q_value - current_q_values)).reshape(1, self.num_actions)
+
+        # Calculate the loss and update the primary model
+        loss = F.mean_squared_error(current_q_values, updated_q_value)
+        losses.append(float(loss.array))
+        loss.backward()
+        self.optimizer.update()
+
+        self.update_count += 1
+
+        if self.update_count % self.update_frequency == 0:
+            # Copy the parameters from the primary model to the target model
+            self.target_model.copyparams(self.primary_model)
+
+        # if t % 500 == 0:
+        #   print(updated_q_value)
+
+
+    def get_action(self, state, epsilon):
+        # Epsilon-greedy action selection
+        if np.random.random() < epsilon:
+            action = np.random.randint(0, 3)  # Choose a random action
+        else:
+            action = (self.primary_model(np.array([state]))).data.argmax()# Choose the action with the highest Q-value
+        return action
+
+class QLearningAgent:
+    def __init__(self, model, target_model, num_states, num_actions, alpha=0.1, gamma=0.99, update_frequency=25):
+        self.num_states = num_states
+        self.num_actions = num_actions
+        self.alpha = alpha  # learning rate
+        self.gamma = gamma  # discount factor
+        self.primary_model = model
+        self.target_model = target_model
+        self.optimizer = optim.RMSprop(model.parameters(), lr=0.001, alpha=0.25, eps=1e-5)
+
+        self.update_frequency = update_frequency
+        self.update_count = 0
+
+    def get_q_value(self, state, action=0):
+        state_tensor = torch.Tensor(np.array([state]))
+        q = self.primary_model(state_tensor)
+        return q
+
+    def update_q_value(self, state, action, reward, next_state, t):
+        self.primary_model.zero_grad()
+        self.target_model.zero_grad()
+
+        state_tensor = torch.Tensor(np.array([state]))
+        current_q_values = self.primary_model(state_tensor)
+        max_next_q_value = self.target_model(torch.Tensor(np.array([next_state]))).max().item()
+
+        self.alpha = 0.9 # Learning rate
+
+        # Calculate Q-value with Double Q-learning
+        #updated_q_value = (np.array(reward) + (self.gamma * max_next_q_value - current_q_values)).reshape(1, self.num_actions)
+        updated_q_value = np.add(np.array(reward), (self.gamma * max_next_q_value - current_q_values.detach().numpy())).reshape(1, self.num_actions)
+
+        updated_q_tensor = torch.Tensor(updated_q_value)
+
+        # Calculate the loss and update the primary model
+        loss = F.mse_loss(current_q_values, updated_q_tensor)
+        # print('Current Q: ', current_q_values)
+        # print('Updated Q: ', updated_q_tensor)
+        # print('Loss: ',loss)
+        losses.append(float(loss.item()))
+        loss.backward()
+        self.optimizer.step()
+
+        self.update_count += 1
+
+        if self.update_count % self.update_frequency == 0:
+            # Copy the parameters from the primary model to the target model
+            self.target_model.load_state_dict(self.primary_model.state_dict())
+
+    def get_action(self, state, epsilon):
+        # Epsilon-greedy action selection
+        if np.random.random() < epsilon:
+            action = np.random.randint(0, self.num_actions)  # Choose a random action
+        else:
+            state_tensor = torch.Tensor(np.array([state]))
+            action = self.primary_model(state_tensor).argmax().item()  # Choose the action with the highest Q-value
+        return action
+
+#Untrained model
+model = Q_Network(25,100,3)
+model.reset()
+agent = QLearningAgent(model, model, num_states=1000, num_actions=3)
+
+#loading trained model
+# loaded_chainer_model = Q_Network(28,100,3)
+# serializers.load_npz('chainer_model.npz', loaded_chainer_model)
+# agent = QLearningAgent(loaded_chainer_model, loaded_chainer_model, num_states=1000, num_actions=3)
+
+num_episodes = 100
+
+for episode in range(num_episodes):
+    state = env.reset()
+    actions = []
+
+    for t in range(env.max_steps):
+        #print(agent.get_action(state, epsilon=0))
+        ep = 1/((env.current_step+1)/100)
+        # if ep < .1:
+        #   ep = .1
+        # else:
+        #   pass
+        action = agent.get_action(state, epsilon = ep)
+        actions.append(action)
+        next_state, reward, done = env.step(action)
+
+        agent.update_q_value(state, action, reward, next_state, t)
+        state = next_state
+
+        if t % 1000 == 0 and t != 0:
+            print(f"Episode {episode}, Q Values: {agent.get_q_value(state)}, Loss: {round(np.array(losses[-1000:]).sum(), 2)}, Time Step: {t}")
+            #print(pd.DataFrame(np.array(actions[t-1000:t]))[0].value_counts())
+            print(pd.DataFrame(np.array(actions[t-999:t]))[0].value_counts())
+
+            if done:
+                break
+
+    #agent.update_epsilon()
+
+    # if episode % 100 == 0:
+    #     print(f"Episode {episode}, Q Values: {agent.get_q_value(state)}")
+    #     print(pd.DataFrame(np.array(actions))[0].value_counts())
+
+syn = CreateSyntheticData(desired_intervals=(1000), nonstationary=0, nonstationary_multiplier=1,
+                          mean=0.000,#0.0015615087596329946,
+                          std=0.0022)#377589427071634)
+
+plt.plot(syn['Close'])
+
+test2 = syn
+rewards = []
+actions = []
+just_looking = []
+balance = []
+btc = 100
+
+buying_power = 50
+portfolio_value = 50
+
+share_price = 10
+
+states = np.zeros((32, 10, 25)).tolist()
+
+iteration = 0
+env = RandomTradingEnv(12)
+t = env.history_t
+#pobs = env.reset()
+done = False
+in_btc = [0]
+acts = [np.random.randint(3) for _ in range(t-1)] + [2]
+prices = [0 for _ in range(t)]
+last_non_stay = 2
+portfolio_change = [0]
+pct_changes = [0]
+shares_held = 0
+
+for i in test2.tail(len(test2)-(t+2)).index:
+    slice = test2[i-(t+2):i-1]
+    close = (((slice['Close'] - slice['Close'].shift(1)) / slice['Close'].shift(1)).to_list()[1:])
+
+    if iteration == 0:
+      last_close = slice.tail(1).reset_index()['Close'][0]
+    else:
+      pct_change = ((slice['Close'] - slice['Close'].shift(1)) / slice['Close'].shift(1)).to_list()[-1]
+      prices.pop(0)
+      prices.append(pct_change)
+
+      portfolio_value += portfolio_value * pct_change
+      share_price += share_price * pct_change
+      btc += btc * pct_change
+      pct_changes.append(pct_change)
+      if len(pct_changes) >= 1000:
+          pct_changes.pop(0)
+
+
+    pobs = [shares_held] + acts + prices
+
+    pobs = list(map(np.float32, pobs))
+    pact = agent.get_action(np.array(pobs, dtype=np.float32), epsilon=0.0)
+    q_values = agent.get_q_value(np.array(pobs, dtype=np.float32))
+
+    acts.pop(0)
+    acts.append(pact)
+
+    if iteration % 100 == 0:
+      print(iteration)
+      print(agent.get_q_value(np.array(pobs)))
+    else:
+      pass
+
+    actions.append(pact)
+
+    if pact == 0:
+      pass
+    elif pact == 1:
+      if buying_power >= share_price:
+        portfolio_value += share_price
+        buying_power -= share_price
+        shares_held += 1
+      else:
+        portfolio_value += buying_power
+        buying_power = 0
+
+    elif pact == 2:
+      if portfolio_value >= share_price:
+        buying_power += share_price
+        portfolio_value -= share_price
+        shares_held -= 1
+      else:
+        buying_power += portfolio_value
+        portfolio_value = 0
+    iteration += 1
+    balance.append((portfolio_value + buying_power))
+    just_looking.append(btc)
+
+print('Portfolio Increase: ',round((balance[-1] - 100),2), '%')
+print('BTC Increase: ',round((just_looking[-1] - 100),2), '%')
+
+pd.DataFrame(np.array(actions))[0].value_counts()
+
+plt.plot(balance, label='Portfolio')
+plt.plot(just_looking, label='BTC')
+plt.legend()
+
+def is_primarily_sequence_12(lst):
+    if len(lst) < 2:
+        return False
+
+    pattern = [1, 2]
+    count = 0
+    for i in range(len(lst) - 1):
+        if lst[i:i+2] == pattern:
+            count += 1
+    print(count)
+    # If more than half of the list contains the pattern [1, 2], consider it primarily constituted by the sequence
+    return count / (len(lst) - 1) > 0.5
+
+is_primarily_sequence_12(actions)
+
+def rolling_average(data, window_size):
+    rolling_averages = []
+    for i in range(0, len(data), window_size):
+        window = data[i:i+window_size]
+        if window:  # Check if the window is not empty
+            average = sum(window) / len(window)
+            rolling_averages.append(average)
+    return rolling_averages
+
+# Compute rolling averages with a window size of 100
+window_size = 100
+averages = rolling_average(losses, window_size)
+
+#averages = averages[-50:]
+data = pd.DataFrame({'Index': range(len(averages)), 'Values': averages})
+
+# Create a regplot using Seaborn
+sns.regplot(x='Index', y='Values', data=data, scatter=True)
